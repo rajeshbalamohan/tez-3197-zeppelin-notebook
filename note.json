@@ -1,0 +1,882 @@
+{
+  "paragraphs": [
+    {
+      "text": "/**\n * Licensed to the Apache Software Foundation (ASF) under one\n * or more contributor license agreements.  See the NOTICE file\n * distributed with this work for additional information\n * regarding copyright ownership.  The ASF licenses this file\n * to you under the Apache License, Version 2.0 (the\n * \"License\"); you may not use this file except in compliance\n * with the License.  You may obtain a copy of the License at\n *\n *     http://www.apache.org/licenses/LICENSE-2.0\n *\n * Unless required by applicable law or agreed to in writing, software\n * distributed under the License is distributed on an \"AS IS\" BASIS,\n * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n * See the License for the specific language governing permissions and\n * limitations under the License.\n */\n \nimport java.io._\n\nimport org.apache.hadoop.conf.Configuration\nimport org.apache.tez.analyzer.plugins._\nimport org.apache.tez.history.parser._\nimport org.apache.tez.history.parser.datamodel.DagInfo\n\nimport scala.collection.JavaConversions._\n\n/**\n * \n * This zeppelin notebook is used for analyzing DagFiles downloaded via Tez-UI or via standalone ATSImportTool.\n * This notebook processe the dagFile and runs the DagInfo through a set of analyzers already pre-defined in Tez.\n * Results of analyzers are saved in RDD which are registered as tables in SparkSQL. This can be queried at runtime.\n * \n * Installation:\n * - Install latest version of zeppelin\n * - Compile tez master and copy all tez jar files to incubator-zeppelin/interpreter/spark/dep/\n * - Start zeppelin\n * - Import this notebook\n * - Install \"DOT\" in zeppelin machine to convert DOT file to PDF.\n * - Click on \"Run\" button in this paragrah\n *    - This should prompt input fields like \"dagFile\", \"dagName\", \"tmpDir\". Populate these fields and run again.\n * */\n\n  /**\n   * Get dagFile, dagName, tmpDir as inputs from end user\n   * */\n  //TODO: Carry out some error handling if on dagFile existence, dagName validation, tmpDir existence etc\n  var dagFile \u003d z.input(\"dagFile\")\n  var dagName \u003d z.input(\"dagName\")\n  var tmpDir \u003d z.input(\"tmpDir\", \"\")\n\n  /**\n   * Define all classes needed for mapping to RDD\n   * */\n  case class VertexCriticalPath(CriticalPath: String, Score: String)\n\n  case class Shuffle(vertexName: String, taskAttemptId: String, Node: String,\n                counterGroup: String, Comments: String,\n                REDUCE_INPUT_GROUPS: String, REDUCE_INPUT_RECORDS: String,\n                ratio: String, SHUFFLE_BYTES: String, TotalTimeTaken: String,\n                TimeTaken_To_Receive_Events: String, MERGE_PHASE_TIME: String,\n                SHUFFLE_PHASE_TIME: String, TimeTaken_For_Real_Task: String,\n                FIRST_EVENT_RECEIVED: String, LAST_EVENT_RECEIVED: String,\n                SHUFFLE_BYTES_DISK_DIRECT: String)\n\n  case class Skew(vertexName: String, taskAttemptId: String,\n                counterGroup: String, node: String,\n                REDUCE_INPUT_GROUPS: String, REDUCE_INPUT_RECORDS: String,\n                input_records_to_group_ratio: String, SHUFFLE_BYTES: String,\n                timeTaken: String, observation: String)\n\n  case class SlowestVertex(vertexName: String, taskAttempts: String, totalTime: String,\n                shuffleTime: String, shuffleTime_Max: String,\n                LastEventReceived: String, LastEventReceivedFrom: String,\n                percentile_75: String, percentile95: String,\n                percentile_98: String, Median: String,\n                observation: String, comments: String)\n\n  case class SlowTask(vertexName: String, taskAttemptId: String, Node: String,\n                taskDuration: String, Status: String, diagnostics: String,\n                NoOfInputs: String)\n\n  case class Spill(vertexName: String, taskAttemptId: String, Node: String,\n                counterGroupName: String, spillCount: String, taskDuration: String,\n                OUTPUT_BYTES: String, OUTPUT_RECORDS: String, SPILLED_RECORDS: String,\n                Recommendation: String\n                )\n\n  case class SlowNode(nodeName: String, noOfTasksExecuted: String, noOfKilledTasks: String,\n                noOfFailedTasks: String, avgSucceededTaskExecutionTime: String,\n                avgKilledTaskExecutionTime: String, avgFailedTaskExecutionTime: String,\n                avgHDFSBytesRead: String, avgHDFSBytesWritten: String,\n                avgFileBytesRead: String, avgFileBytesWritten: String,\n                avgGCTimeMillis: String, avgCPUTimeMillis: String\n                )\n\n  case class TaskConcurrency(time: String, vertexName: String, concurrentTasksRunning: String)\n\n  case class ContainerReuse(vertexName: String, taskAttempts: String, node: String,\n                containerId: String, reuseCount: String)\n\n  case class Locality(vertexName: String, numTasks: String, dataLocalRatio: String,\n                rackLocalRatio: String, otherRatio: String, avgDataLocalTaskRuntime: String,\n                avgRackLocalTaskRuntime: String, avgOtherLocalTaskRuntime: String,\n                noOfInputs: String, avgHDFSBytesRead_DataLocal: String,\n                avgHDFSBytesRead_RackLocal: String, avgHDFSBytesRead_Others: String,\n                recommendation: String)\n\n    /**\n      * Load ATS data and parse it.\n      **/\n    var atsParser \u003d new ATSFileParser(new File(dagFile.toString()));\n    var dagInfo \u003d atsParser.getDAGData(dagName.toString());\n\n    println(\"Done with parsing  \" + dagInfo.toString + \", \" + tmpDir.toString())\n\n    val config \u003d new Configuration\n    \n    // Vertex Level Critical Path Analysis\n    config.set(\"tez.critical-path.analyzer.dot.output.loc\", tmpDir.toString())\n    val vertexLevelCriticalPathAnalyzer \u003d new VertexLevelCriticalPathAnalyzer(config)\n    vertexLevelCriticalPathAnalyzer.analyze(dagInfo)\n    val vcResult \u003d vertexLevelCriticalPathAnalyzer.getResult.getRecordsIterator.map { record \u003d\u003e\n      VertexCriticalPath(record(0), record(1))\n    }\n    sc.makeRDD(vcResult.toSeq).toDF().registerTempTable(\"vertex_criticalPath_\" + dagName.toString())\n    \n    \n    // Critical Path analysis (generates graph in tmpDir)\n    config.set(\"output-dir\", tmpDir.toString())\n    config.set(\"tez.critical-path-analyzer.draw-svg\", \"true\")\n    val criticalPathAnalyzer \u003d new CriticalPathAnalyzer(config)\n    criticalPathAnalyzer.setConf(config)\n    criticalPathAnalyzer.analyze(dagInfo)\n    val result \u003d criticalPathAnalyzer.getResult // no additional mappings needed as it would generate SVG\n    \n    \n    // Shuffle Time Analysis\n    config.set(\"tez.shuffle-time-analyzer.real-work.done.ratio\", \"0.4\") /* Ratio of (total time - shuffle time) / (total time).*/\n    config.set(\"tez.shuffle-time-analyzer.shuffle.min.records\", \"100\") /*Filtering: num of min records that needs to be available as reduce input records*/\n    val shuffleTimeAnalyzer \u003d new ShuffleTimeAnalyzer(config)\n    shuffleTimeAnalyzer.analyze(dagInfo)\n    val shuffleTimeAnalyzerResult \u003d shuffleTimeAnalyzer.getResult.getRecordsIterator.map { s \u003d\u003e\n      Shuffle(s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7), s(8),\n        s(9), s(10), s(11), s(12), s(13), s(14), s(15), s(16))\n    }\n    sc.makeRDD(shuffleTimeAnalyzerResult.toSeq).toDF().registerTempTable(\"shuffle_time_analysis_\" + dagName.toString())\n    \n    \n    // Skew Analysis\n    config.set(\"tez.skew-analyzer.shuffle.bytes.per.source\", \"100000\")\n    config.set(\"tez.skew-analyzer.shuffle.key.group.min.ratio\", \"0.2\") /*Filtering: Min reducer input group : reducer keys ratio for computation*/\n    config.set(\"tez.skew-analyzer.shuffle.key.group.max.ratio\", \"0.6\") /*Filtering: Max reducer input group : reducer keys ratio for computation*/\n    val skewAnalyzer \u003d new SkewAnalyzer(config)\n    skewAnalyzer.analyze(dagInfo)\n    val skewAnalyzerResult \u003d skewAnalyzer.getResult.getRecordsIterator.map { s \u003d\u003e\n      Skew(s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7), s(8), s(9))\n    }\n    sc.makeRDD(skewAnalyzerResult.toSeq).toDF().registerTempTable(\"skew_analysis_\" + dagName.toString())\n    \n    \n    // Slow Vertex Analysis\n    config.setLong(\"tez.slowest-vertex-analyzer.max.vertex.runtime\", 50000) /* For demo. Anything \u003e 50 seconds is considered slow */\n    val slowestVertexAnalyzer \u003d new SlowestVertexAnalyzer(config)\n    slowestVertexAnalyzer.analyze(dagInfo)\n    val slowVertexResult \u003d slowestVertexAnalyzer.getResult.getRecordsIterator.map { s \u003d\u003e\n      SlowestVertex(s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7),\n        s(8), s(9), s(10), s(11), s(12))\n    }\n    sc.makeRDD(slowVertexResult.toSeq).toDF().registerTempTable(\"slow_vertex_analysis_\" + dagName.toString())\n    \n    \n    // Slow Task Analysis\n    config.set(\"tez.slow-task-analyzer.task.count\", \"500000\") //how many tasks to pull\n    val slowTaskIdentifier \u003d new SlowTaskIdentifier(config)\n    slowTaskIdentifier.analyze(dagInfo)\n    val slowTaskResult \u003d slowTaskIdentifier.getResult.getRecordsIterator.map { s \u003d\u003e\n      SlowTask(s(0), s(1), s(2), s(3), s(4), s(5), s(6))\n    }\n    sc.makeRDD(slowTaskResult.toSeq).toDF().registerTempTable(\"slow_task_analysis_\" + dagName.toString())\n    \n    // Spill Analysis\n    config.set(\"tez.spill-analyzer.min.output.bytes.threshold\", \"50000\") //min amount of bytes that needs to be churned out by a task.\n    val spillAnalyzer \u003d new SpillAnalyzerImpl(config)\n    spillAnalyzer.analyze(dagInfo)\n    val spillResult \u003d spillAnalyzer.getResult.getRecordsIterator.map { s \u003d\u003e\n      Spill(s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7), s(8), s(9))\n    }\n    sc.makeRDD(spillResult.toSeq).toDF().registerTempTable(\"spill_analysis_\" + dagName.toString())\n    \n    \n    // Slow Node Analysis\n    val slowNodeAnalyzer \u003d new SlowNodeAnalyzer(new Configuration())\n    slowNodeAnalyzer.analyze(dagInfo)\n    val slowNodeResult \u003d slowNodeAnalyzer.getResult.getRecordsIterator.map { s \u003d\u003e\n      SlowNode(s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7)\n        , s(8), s(9), s(10), s(11), s(12))\n    }\n    sc.makeRDD(slowNodeResult.toSeq).toDF().registerTempTable(\"slow_node_analysis_\" + dagName.toString())\n    \n    \n    // Task Concurrency Analysis\n    config.setInt(\"tez.task-concurrency-analyzer.time.interval\", 5000)\n    val taskConcurrencyAnalyzer \u003d new TaskConcurrencyAnalyzer(config)\n    taskConcurrencyAnalyzer.analyze(dagInfo)\n    val taskConcurrencyResult \u003d taskConcurrencyAnalyzer.getResult.getRecordsIterator.map { s \u003d\u003e\n      TaskConcurrency(s(0), s(1), s(2))\n    }\n    sc.makeRDD(taskConcurrencyResult.toSeq).toDF().registerTempTable(\"task_concurrency_analysis_\" + dagName.toString())\n    \n    // Container Resuse Analysis\n    val containerReuseAnalyzer \u003d new ContainerReuseAnalyzer(new Configuration())\n    containerReuseAnalyzer.analyze(dagInfo)\n    val containerReuseResult \u003d containerReuseAnalyzer.getResult.getRecordsIterator.map { s \u003d\u003e\n      ContainerReuse(s(0), s(1), s(2), s(3), s(4))\n    }\n    sc.makeRDD(containerReuseResult.toSeq).toDF().registerTempTable(\"container_reuse_analysis_\" + dagName.toString())\n    \n    \n    // Locality Analysis\n    val localityAnalyzer \u003d new LocalityAnalyzer(new Configuration())\n    localityAnalyzer.analyze(dagInfo)\n    val localityResult \u003d localityAnalyzer.getResult.getRecordsIterator.map { s \u003d\u003e\n      Locality(s(0), s(1), s(2), s(3), s(4), s(5), s(6), s(7), s(8),\n        s(9), s(10), s(11), s(12))\n    }\n    sc.makeRDD(localityResult.toSeq).toDF().registerTempTable(\"locality_analysis_\" + dagName.toString())\n    \n    println(\"Created all tables for \" + dagName)\n",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:35 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/scala",
+        "tableHide": false,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": "\u003cPROVIDE_DAG_NAME\u003e",
+          "tmpDir": "\u003cPROVIDE_TMP_DIR_NAME\u003e",
+          "dagFile": "\u003cPROVIDE_COMPLETE_FILE_LOCATION_OF_DAG_ZIP\u003e"
+        },
+        "forms": {
+          "dagFile": {
+            "name": "dagFile",
+            "displayName": "dagFile",
+            "type": "input",
+            "defaultValue": "",
+            "hidden": false
+          },
+          "dagName": {
+            "name": "dagName",
+            "displayName": "dagName",
+            "type": "input",
+            "defaultValue": "",
+            "hidden": false
+          },
+          "tmpDir": {
+            "name": "tmpDir",
+            "displayName": "tmpDir",
+            "type": "input",
+            "defaultValue": "",
+            "hidden": false
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849289_-73202145",
+      "id": "20160405-132729_1888198738",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:29:37 PM",
+      "dateFinished": "Apr 5, 2016 1:30:10 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Critical Path Analyzer",
+      "text": "// Set MACHINE/HTML_DIR as per your environment. SVG would be placed in tmpDir listed in the above paragrah. It would be good to map that directory to the html folder.\nprintln(\"%html \u003cimg src\u003d\u0027http://MACHINE/HTML_DIR/\" + z.input(\"dagName\") + \".svg\u0027 alt\u003d\u0027Critical Path Analyzer\u0027\u003e\")\n",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:37 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "tmpDir": "dag_1449839819858_666490_1",
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "displayName": "dagName",
+            "type": "input",
+            "defaultValue": "",
+            "hidden": false
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849293_-74741141",
+      "id": "20160405-132729_356987213",
+      "result": {
+        "code": "SUCCESS",
+        "type": "HTML",
+        "msg": "\u003cimg src\u003d\u0027http://MACHINE/HTML_DIR/.svg\u0027 alt\u003d\u0027Critical Path Analyzer\u0027\u003e\n"
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:29:38 PM",
+      "dateFinished": "Apr 5, 2016 1:30:10 PM",
+      "status": "FINISHED",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Convert Dot To PDF (For CriticalPath Analyzer @ Vertex Level)",
+      "text": "%sh \n// Provide the same tmpDir location as in first paragraph. Zeppelin does not have the feature to share variables across different interpreters.\ndot -Tpdf /\u003cTMPDIR\u003e/${dagName}.dot \u003e /MACHINE/HTML_DIR/${dagName}.pdf\n",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:38 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": false
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849293_-74741141",
+      "id": "20160405-132729_332133842",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:29:42 PM",
+      "dateFinished": "Apr 5, 2016 1:29:45 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "CriticalPath Analyzer @ Vertex Level",
+      "text": "// Set  MACHINE/HTML_DIR as per your environment. DOT would be placed in tmpDir listed in the above paragrah. It would be good to map that directory to the html folder.\n// DOT program is needed for it to generate PDF\nprintln(\"%html \u003cobject data\u003d\u0027http://MACHINE/HTML_DIR/\" + z.input(\"dagName\") + \".pdf\u0027 type\u003d\u0027application/pdf\u0027 width\u003d\u0027100%\u0027 height\u003d\u0027500\u0027\u003e\u003cparam name\u003d\u0027view\u0027 value\u003d\u0027fitH\u0027 /\u003e\u003cp\u003eIt appears you don\u0027t have a PDF plugin for this browser. No biggie... you can \u003ca href\u003d\u0027http://cn041-10.l42scl.hortonworks.com/rajesh/analyzer/dot/\" + z.input(\"dagName\") + \".pdf\u0027\u003eclick here to download the PDF file.\u003c/a\u003e\u003c/p\u003e\u003c/object\u003e\")\n",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:42 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "displayName": "dagName",
+            "type": "input",
+            "defaultValue": "",
+            "hidden": false
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849293_-74741141",
+      "id": "20160405-132729_159438004",
+      "result": {
+        "code": "SUCCESS",
+        "type": "HTML",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:10 PM",
+      "dateFinished": "Apr 5, 2016 1:30:12 PM",
+      "status": "FINISHED",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Slow Vertex Analyzer - Find Out Runtime Percentiles, Whether It Was Slow Due To Upstream Vertex / Straggler Etc",
+      "text": "%sql SELECT *\nFROM slow_vertex_analysis__${dagName}\nORDER BY cast(totalTime AS int) DESC",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:43 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849294_-73586894",
+      "id": "20160405-132729_1302631489",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:11 PM",
+      "dateFinished": "Apr 5, 2016 1:30:13 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "TaskConcurrency Analyzer (Starvation Analysis) - Find Out How Slots Were Given/Used For Different Vertices",
+      "text": "%sql select (cast(time as bigint)) as time, vertexName, concurrentTasksRunning from task_concurrency_analysis__${dagName}",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:45 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "lineChart",
+          "height": 300.0,
+          "optionOpen": true,
+          "keys": [
+            {
+              "name": "time",
+              "index": 0.0,
+              "aggr": "sum",
+              "$$hashKey": "object:267"
+            }
+          ],
+          "values": [
+            {
+              "name": "concurrentTasksRunning",
+              "index": 2.0,
+              "aggr": "avg",
+              "$$hashKey": "object:271"
+            }
+          ],
+          "groups": [
+            {
+              "name": "vertexName",
+              "index": 1.0,
+              "aggr": "sum",
+              "$$hashKey": "object:269"
+            }
+          ],
+          "scatter": {
+            "xAxis": {
+              "name": "time",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "vertexName",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849294_-73586894",
+      "id": "20160405-132729_1631918561",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:11 PM",
+      "dateFinished": "Apr 5, 2016 1:30:13 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "SlowTask Identifier - Query Slow Tasks At Every Vertex (Change SQL Filters Accordingly)",
+      "text": "%sql SELECT *\nFROM slow_task_analysis__${dagName}  -- For demo, try to analyze the straggler task from Map 5 identified above (notice most of all stragglers ran on same node cn058)\nORDER BY cast(taskDuration AS int) DESC LIMIT 100",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:46 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/scala",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849295_-73971643",
+      "id": "20160405-132729_770442622",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:13 PM",
+      "dateFinished": "Apr 5, 2016 1:30:13 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Spill Analysis - Find Out If Any Spills Happened In The Task (Adjust Sort Buffer Accordingly)",
+      "text": "%sql SELECT vertexName,\n       taskAttemptId,\n       Node,\n       counterGroupName,\n       spillCount,\n       taskDuration,\n       OUTPUT_BYTES,\n       OUTPUT_BYTES,\n       SPILLED_RECORDS,\n       Recommendation\nFROM spill_analysis__${dagName} WHERE counterGroupName !\u003d \u0027org.apache.tez.common.counters.TaskCounter\u0027\nORDER BY cast(taskDuration AS int) DESC LIMIT 1000",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:47 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849296_-63583422",
+      "id": "20160405-132729_575033603",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:13 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Skew Analyzer (For Shuffle) - To Understand Issues Related To Partitioner / Parallelism / Memory Issues Based On REDUCE_INPUT_GROUPS / REDUCE_INPUT_RECORDS",
+      "text": "%sql SELECT vertexName,\n       taskAttemptId,\n       counterGroup,\n       node,\n       SHUFFLE_BYTES,\n       timeTaken,\n       REDUCE_INPUT_GROUPS,\n       REDUCE_INPUT_RECORDS,\n       input_records_to_group_ratio,\n       observation\nFROM skew_analysis__${dagName}\nORDER BY cast(timeTaken AS int) DESC LIMIT 100",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:47 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "vertexName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "taskAttemptId",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "vertexName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "taskAttemptId",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849301_-65507167",
+      "id": "20160405-132729_1269424022",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Shuffle Time Analysis @ Attempt Level",
+      "text": "%sql SELECT vertexName,\n       taskAttemptId,\n       counterGroup,\n       Node,\n       SHUFFLE_BYTES,\n       TotalTimeTaken,\n       TimeTaken_To_Receive_Events,\n       SHUFFLE_PHASE_TIME,\n       MERGE_PHASE_TIME,\n       TimeTaken_For_Real_Task,\n       FIRST_EVENT_RECEIVED,\n       LAST_EVENT_RECEIVED,\n       SHUFFLE_BYTES_DISK_DIRECT\nFROM shuffle_time_analysis__${dagName}\nWHERE counterGroup !\u003d \u0027org.apache.tez.common.counters.TaskCounter\u0027 -- AND (SHUFFLE_PHASE_TIME - LAST_EVENT_RECEIVED) \u003e 10000  --(to demo if shuffle is slow due to last event received; ie higher vertex)\nORDER BY cast(SHUFFLE_PHASE_TIME AS int) DESC LIMIT 100",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:48 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849302_-64352920",
+      "id": "20160405-132729_48909587",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "ShuffleVertexManager Slowstart Analysis (Whether Slow Start Is Needed Or Should Be Tuned Etc, Based On FIRST_EVENT_RECEVIED Vs LAST_EVENT_RECEIVED)",
+      "text": "%sql SELECT vertexName, -- This is just example. Change the query to suite your needs. Might want to try out at vertex level and tweak ShuffleVertexManager slowstart settings\n       taskAttemptId,\n       \u0027This task got scheduled too soon. Ended up wasting slot\u0027 AS description,\n       Node,\n       ((LAST_EVENT_RECEIVED - FIRST_EVENT_RECEIVED) / TotalTimeTaken) AS wastageRatio\nFROM shuffle_time_analysis__${dagName}\nWHERE counterGroup !\u003d \u0027org.apache.tez.common.counters.TaskCounter\u0027\n  AND ((LAST_EVENT_RECEIVED - FIRST_EVENT_RECEIVED) / TotalTimeTaken) \u003e 0\nORDER BY cast(wastageRatio AS int) DESC LIMIT 100",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:49 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849303_-64737669",
+      "id": "20160405-132729_1331720133",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Container Preemption Diagnostics (E.G Find Number Of Prematurely Killed Task Attempts Done Via Scheduler. E.G Adjust Tez.Am.Preemption.Percentage)",
+      "text": "%sql SELECT vertexName,\n       \"Internal Container Pre-emption\" AS description,\n       count(*) AS totalPreemptionCount\nFROM slow_task_analysis__${dagName}\nWHERE DIAGNOSTICS LIKE \u0027%preempted%\u0027\n  AND status LIKE \u0027KILLED\u0027\nGROUP BY vertexName -- May be we need to find the ratio of total attempts vs pre-emption to understand the wastage??",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:51 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849303_-64737669",
+      "id": "20160405-132729_1597960547",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Slow Nodes - Find Out If There Any Slow Nodes In The Cluster (Need To Co-Relate NoOfTasksExecuted Vs AvgTaskExecutionTime Vs BytesRead/Written)",
+      "text": "%sql SELECT nodeName,\n       noOfTasksExecuted,\n       noOfKilledTasks,\n       noOfFailedTasks,\n       avgSucceededTaskExecutionTime,\n       avgKilledTaskExecutionTime,\n       avgFailedTaskExecutionTime,\n       avgHDFSBytesRead,\n       avgHDFSBytesWritten,\n       avgFileBytesRead,\n       avgFileBytesWritten,\n       avgGCTimeMillis,\n       avgCPUTimeMillis\nFROM slow_node_analysis__${dagName} ORDER BY cast(avgSucceededTaskExecutionTime as int) DESC,  cast(noOfTasksExecuted as int) DESC ",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:52 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849304_-66661414",
+      "id": "20160405-132729_1517207677",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "ContainerReuse Information",
+      "text": "%sql SELECT containerId,\n       node,\n       sum(reuseCount) AS reuse\nFROM container_reuse_analysis__${dagName}\nGROUP BY containerId,\n         node\nORDER BY reuse DESC LIMIT 10",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:53 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849305_-67046163",
+      "id": "20160405-132729_171744502",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Locality Analysis - Whether Locality Issues Ended Up Affecting The Job/Vertex Time",
+      "text": "%sql SELECT *\nFROM locality_analysis__${dagName}\nORDER BY numTasks DESC",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:55 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849305_-67046163",
+      "id": "20160405-132729_1190057011",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "title": "Slow Vertex Analyzer - Find Out Runtime Percentiles, Whether It Was Slow Due To Upstream Vertex / Straggler Etc",
+      "text": "%sql SELECT *\nFROM  vertex_criticalpath__${dagName}\t\t\nORDER BY SCORE",
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:56 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/sql",
+        "title": true,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "CriticalPath",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "Score",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "CriticalPath",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "Score",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {
+          "dagName": ""
+        },
+        "forms": {
+          "dagName": {
+            "name": "dagName",
+            "defaultValue": "",
+            "hidden": true
+          }
+        }
+      },
+      "jobName": "paragraph_1459862849306_-65891916",
+      "id": "20160405-132729_1861451876",
+      "result": {
+        "code": "ERROR",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "ERROR",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "authenticationInfo": {},
+      "dateUpdated": "Apr 5, 2016 1:29:57 PM",
+      "config": {
+        "colWidth": 12.0,
+        "editorMode": "ace/mode/scala",
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        },
+        "enabled": true
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1459862849307_-66276665",
+      "id": "20160405-132729_1119017199",
+      "result": {
+        "code": "SUCCESS",
+        "type": "TEXT",
+        "msg": ""
+      },
+      "dateCreated": "Apr 5, 2016 1:27:29 PM",
+      "dateStarted": "Apr 5, 2016 1:30:14 PM",
+      "dateFinished": "Apr 5, 2016 1:30:14 PM",
+      "status": "FINISHED",
+      "progressUpdateIntervalMs": 500
+    }
+  ],
+  "name": "Tez_ATS_JobAnalyzer",
+  "id": "2BEMKF2QP",
+  "angularObjects": {
+    "2BF48VPM1": [],
+    "2BGK4BTMZ": [],
+    "2BFVVMW13": [],
+    "2BGFDRX55": [],
+    "2BGG45941": [],
+    "2BFH37TAF": [],
+    "2BDR9QZJT": [],
+    "2BGU9DJPB": [],
+    "2BDP2PQYW": [],
+    "2BH4CKZ1K": [],
+    "2BEGT8UZQ": [],
+    "2BEKNRTSM": [],
+    "2BF6RTTQA": [],
+    "2BFQW17KX": [],
+    "2BDWPY1QM": [],
+    "2BDMS23X5": [],
+    "2BFPZRRHN": [],
+    "2BECFZ18V": []
+  },
+  "config": {},
+  "info": {}
+}
